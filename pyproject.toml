@@ -19,6 +19,7 @@ packages = [
     "coke.pusher",
     "coke.guide",
     "coke.charger",
+    "coke.charger.segmented",
     "coke.quench",
     "coke.gas",
     "coke.door",

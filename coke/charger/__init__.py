@@ -7,6 +7,30 @@
 from __future__ import annotations
 
 from .machine import ChargingCar
+from .segmented import (
+    DEVIATION_BASIS,
+    POLICY_CORRECT_CONTINUE,
+    POLICY_STOP_REPORT,
+    ChargeBook,
+    SegmentRecord,
+    build_segment_plan,
+    reconcile,
+)
 from .snapshot import ChargerSnapshot
+from .weighbridge import SCALE_DRIFT, SCALE_LINK, SCALE_OK, Weighbridge
 
-__all__ = ["ChargingCar", "ChargerSnapshot"]
+__all__ = [
+    "ChargingCar",
+    "ChargerSnapshot",
+    "ChargeBook",
+    "DEVIATION_BASIS",
+    "POLICY_CORRECT_CONTINUE",
+    "POLICY_STOP_REPORT",
+    "SCALE_DRIFT",
+    "SCALE_LINK",
+    "SCALE_OK",
+    "SegmentRecord",
+    "Weighbridge",
+    "build_segment_plan",
+    "reconcile",
+]

@@ -14,6 +14,9 @@ import threading
 from .audit.log import AuditLog
 from .audit.record import AuditRecord
 from .charger.machine import ChargingCar
+from .charger.segmented.ledger import ChargeBook
+from .charger.segmented.reconcile import reconcile
+from .charger.weighbridge import Weighbridge
 from .clock import Clock, SystemClock
 from .config import PlatformConfig, default_config
 from .door.latch import DoorLatch
@@ -39,7 +42,13 @@ from .pusher.machine import PusherMachine
 from .pusher.speed import SpeedArbiter
 from .pusher.stroke import StrokeBaseline
 from .quench.machine import QuenchCar
-from .sequence import charge_oven, clean_door, push_oven, quench_oven, reverse_heating
+from .sequence import (
+    charge_oven_segmented,
+    clean_door,
+    push_oven,
+    quench_oven,
+    reverse_heating,
+)
 from .store.journal import JsonlJournal
 from .store.jsonfile import JsonStore
 from .telemetry import TrendBuffer
@@ -81,6 +90,11 @@ class Platform:
         )
         self.guide = GuideCar(self.config.guide)
         self.charger = ChargingCar(self.config.charger)
+        self.scale = Weighbridge(
+            self.config.charger.scale_drift_tolerance_t,
+            self.config.charger.scale_max_rereads,
+        )
+        self.books: dict[str, ChargeBook] = {}
         self.quench_car = QuenchCar(self.config.quench)
         self.collector = CollectorMain(self.config.collector)
         self.flap = BridgeFlap(FlapLatch())
@@ -218,19 +232,231 @@ class Platform:
         hopper_target_mm: float = 0.0,
         hopper_measured_mm: float = 0.0,
         dt: float = 1.0,
+        coal_grade: str | None = None,
+        delivery_ratio: float | None = None,
+        segment_ratios: list[float] | tuple[float, ...] | None = None,
     ) -> dict:
-        """装煤编排：煤斗对位 → 调压 → 开翻板 → 给煤。"""
+        """分段装煤编排：煤斗对位 → 调压 → 开翻板 → 分段称重给煤 → 三处对账。
+
+        ``delivery_ratio`` 是全炉固定给煤系数；``segment_ratios`` 可按段覆盖
+        （长度必须等于分段数），用于现场按段注入已知偏差、核对停车与修正。
+        """
 
         with self._lock:
             op_id = self.ids.next()
-            report = charge_oven(
-                self.charger, self.collector, self.flap, oven, hopper_target_mm, hopper_measured_mm, dt
+            grade = self.config.coal_grades.get(coal_grade or self.config.coal_grades.default_code())
+            if delivery_ratio is not None:
+                self.charger.set_delivery_ratio(delivery_ratio)
+            ratio_script = None
+            if segment_ratios is not None:
+                ratios = [float(item) for item in segment_ratios]
+                if len(ratios) != self.config.charger.segment_count:
+                    raise CokeError(
+                        f"段系数数量 {len(ratios)} 与分段数 "
+                        f"{self.config.charger.segment_count} 不一致",
+                        component="charger",
+                    )
+                for value in ratios:
+                    if value <= 0.0:
+                        raise CokeError("给煤系数必须为正", component="charger")
+                ratio_script = ratios.__getitem__
+            report, book, readbacks = charge_oven_segmented(
+                self.charger,
+                self.collector,
+                self.flap,
+                self.scale,
+                grade,
+                oven,
+                hopper_target_mm,
+                hopper_measured_mm,
+                op_id,
+                self.config.charger.segment_count,
+                dt,
+                ratio_script,
             )
-            summary = self._record_operation(op_id, "charge", report)
-            summary["op_id"] = op_id
+            self.books[op_id] = book
+            # 非给煤步骤（对位 / 调压 / 翻板）照常落审计；分段步骤逐条显式发布，
+            # 保证审计里的字段就是台账字段，三处对账以此为准。
+            for step in report.get("steps", []):
+                if step["action"] == "charge_segment":
+                    detail = dict(step["detail"])
+                    detail["deviation_basis"] = book.deviation_basis
+                    detail["coal_grade"] = grade.code
+                    detail["policy"] = grade.policy
+                    self.bus.publish(
+                        Event.of(
+                            "charger",
+                            "charger",
+                            "charge_segment",
+                            oven=oven,
+                            op_id=op_id,
+                            severity="notice" if detail["verdict"] == "within" else "warning",
+                            message=(
+                                f"第 {detail['segment'] + 1} 段称重 {detail['weighed_t']}t，"
+                                f"偏差 {detail['deviation_t']}t：{detail['verdict']}"
+                            ),
+                            **detail,
+                        )
+                    )
+                    continue
+                detail = {
+                    key: value
+                    for key, value in step.get("detail", {}).items()
+                    if not isinstance(value, (dict, list))
+                }
+                self.bus.publish(
+                    Event.of(
+                        step["component"],
+                        step["component"],
+                        step["action"],
+                        oven=oven,
+                        op_id=op_id,
+                        severity="notice",
+                        **detail,
+                    )
+                )
+
+            reconciliation = None
+            if book.records:
+                # 对账走落盘流水全量回放（跨重启、不受内存窗口限制），保证这一炉
+                # 的每个 charge_segment 都在三处核对范围内。
+                audit_entries = self.audit.to_records(self.audit.replay_from_journal(limit=100_000))
+                audit_dicts = [entry.as_dict() for entry in audit_entries]
+                reconciliation = reconcile(book, readbacks, audit_dicts)
+                if not reconciliation["ok"]:
+                    report["violations"].append("three_way_mismatch")
+                    report["ok"] = False
+                self.bus.publish(
+                    Event.of(
+                        "audit",
+                        "audit",
+                        "charge_reconciled",
+                        oven=oven,
+                        op_id=op_id,
+                        severity="notice" if reconciliation["ok"] else "alarm",
+                        message=(
+                            "分段累计、称重回读与审计三处一致"
+                            if reconciliation["ok"]
+                            else f"三处对账不一致：{reconciliation['mismatches']}"
+                        ),
+                        **{
+                            key: value
+                            for key, value in reconciliation.items()
+                            if not isinstance(value, (dict, list))
+                            and key not in ("op_id", "oven")
+                        },
+                        mismatch_count=len(reconciliation["mismatches"]),
+                    )
+                )
+
+            if book.stopped:
+                self.bus.publish(
+                    Event.of(
+                        "audit",
+                        "audit",
+                        "charge_oven_flagged",
+                        oven=oven,
+                        op_id=op_id,
+                        severity="alarm",
+                        message=f"一炉给煤被报出：{book.report_reason}",
+                        report_reason=book.report_reason,
+                        coal_grade=grade.code,
+                        policy=grade.policy,
+                        weighed_total_t=book.weighed_total_t(),
+                    )
+                )
+            for violation in report.get("violations", []):
+                if violation in {
+                    "scale_drift",
+                    "scale_readback_failed",
+                    "segment_deviation",
+                    "uncorrectable_final_segment",
+                    "three_way_mismatch",
+                }:
+                    self.bus.publish(
+                        Event.of(
+                            "audit",
+                            "audit",
+                            "interlock_rejected",
+                            oven=oven,
+                            op_id=op_id,
+                            severity="alarm",
+                            message=f"charge 被拒绝：{violation}",
+                            violation=violation,
+                        )
+                    )
+            self.bus.publish(
+                Event.of(
+                    "audit",
+                    "audit",
+                    "charge_complete",
+                    severity="notice" if report.get("ok") else "warning",
+                    message="charge 完成" if report.get("ok") else "charge 未完成",
+                    op_id=op_id,
+                    operation="charge",
+                    oven=oven,
+                    ok=bool(report.get("ok")),
+                    violations=list(report.get("violations", [])),
+                )
+            )
+
+            summary = {
+                "op_id": op_id,
+                "operation": "charge",
+                "oven": oven,
+                "ok": bool(report.get("ok")),
+                "violations": list(report.get("violations", [])),
+            }
             self._operations += 1
             self._persist()
-            return {**report, **summary}
+            step_summary = [
+                {"action": step["action"], "component": step["component"]}
+                for step in report.get("steps", [])
+            ]
+            return {
+                **report,
+                **summary,
+                "steps": step_summary,
+                "coal_grade": grade.code,
+                "policy": grade.policy,
+                "book": book.as_dict(),
+                "scale_readbacks": readbacks,
+                "reconciliation": reconciliation,
+            }
+
+    def charge_book(self, op_id: str) -> dict:
+        """读取一炉的分段累计台账，供控制台展示与巡检核对。"""
+
+        book = self.books.get(op_id)
+        if book is None:
+            raise CokeError(f"找不到装煤台账 {op_id!r}", component="charger")
+        return book.as_dict()
+
+    def charge_books(self) -> list[dict]:
+        """列出最近的分段累计台账。"""
+
+        return [book.as_dict() for book in self.books.values()]
+
+    def set_delivery_ratio(self, ratio: float) -> dict:
+        """设定装煤车给煤系数（现场标定给多给少的偏差来源）。"""
+
+        self.charger.set_delivery_ratio(ratio)
+        return {"delivery_ratio": self.charger.delivery_ratio}
+
+    def disturb_scale_drift(self, offset_t: float) -> dict:
+        """模拟在线秤零点漂移（部分失败），返回漂移后偏移。"""
+
+        self.scale.inject_drift(offset_t)
+        return {
+            "zero_offset_t": round(self.scale.zero_offset(), 3),
+            "drift_tolerance_t": self.scale.drift_tolerance_t,
+        }
+
+    def disturb_scale_link(self, count: int = 1) -> dict:
+        """模拟下一次称重回读链路故障并触发在线补读。"""
+
+        self.scale.force_link_failure(count)
+        return {"failures_pending": int(count), "max_rereads": self.scale.max_rereads}
 
     def push(
         self,
@@ -469,7 +695,20 @@ class Platform:
                 "epoch": self.stroke.epoch,
             },
             "guide": self.guide.snapshot().as_dict(),
-            "charger": self.charger.snapshot().as_dict(),
+            "charger": {
+                **self.charger.snapshot().as_dict(),
+                "segment_count": self.config.charger.segment_count,
+                "segment_deviation_t": self.config.charger.segment_deviation_t,
+                "deviation_basis": "segment",
+                "scale": {
+                    "gross_t": round(self.scale.gross_t(), 3),
+                    "zero_offset_t": round(self.scale.zero_offset(), 3),
+                    "drift_tolerance_t": self.scale.drift_tolerance_t,
+                    "max_rereads": self.scale.max_rereads,
+                },
+                "coal_grades": self.config.coal_grades.as_list(),
+            },
+            "charge_books": [book.as_dict() for book in self.books.values()],
             "quench": self.quench_car.snapshot().as_dict(),
             "gas": {
                 "pressure_pa": round(self.collector.pressure_pa, 2),

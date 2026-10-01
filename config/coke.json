@@ -3,6 +3,20 @@
     "name": "sequence-control",
     "storage_root": "var/state"
   },
+  "coal_grades": [
+    {
+      "code": "standard",
+      "description": "标准配合煤，段偏差越限即停止后续给煤并报炉",
+      "policy": "stop_report",
+      "segment_deviation_t": 0.35
+    },
+    {
+      "code": "blend_b",
+      "description": "易塌孔配煤，允许按真实称重差值修正后续段后继续",
+      "policy": "correct_continue",
+      "segment_deviation_t": 0.5
+    }
+  ],
   "limits": {
     "pusher": {
       "stroke_baseline_mm": 3200.0,
@@ -20,7 +34,11 @@
     "charger": {
       "align_tolerance_mm": 20.0,
       "coal_target_t": 28.0,
-      "feed_rate_t_per_min": 4.0
+      "feed_rate_t_per_min": 4.0,
+      "segment_count": 4,
+      "segment_deviation_t": 0.35,
+      "scale_drift_tolerance_t": 0.2,
+      "scale_max_rereads": 2
     },
     "quench": {
       "travel_distance_m": 42.0,

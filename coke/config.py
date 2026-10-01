@@ -39,6 +39,17 @@ def _number(section: Mapping[str, Any], key: str, *, minimum: float | None = Non
     return number
 
 
+def _integer(section: Mapping[str, Any], key: str, *, minimum: int) -> int:
+    value = section.get(key, _MISSING)
+    if value is _MISSING:
+        raise ConfigError(f"配置缺少字段 {key!r}", component="config")
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError(f"配置字段 {key!r} 必须是整数", component="config")
+    if value < minimum:
+        raise ConfigError(f"配置字段 {key!r} 不得小于 {minimum}", component="config")
+    return int(value)
+
+
 @dataclass(frozen=True)
 class PusherLimits:
     """推焦机行程与速度约束。"""
@@ -88,11 +99,15 @@ class GuideLimits:
 
 @dataclass(frozen=True)
 class ChargerLimits:
-    """装煤车煤斗对齐与给煤约束。"""
+    """装煤车煤斗对齐、分段与在线称重约束。"""
 
     align_tolerance_mm: float
     coal_target_t: float
     feed_rate_t_per_min: float
+    segment_count: int
+    segment_deviation_t: float
+    scale_drift_tolerance_t: float
+    scale_max_rereads: int
 
     @classmethod
     def from_mapping(cls, section: Mapping[str, Any]) -> "ChargerLimits":
@@ -100,10 +115,81 @@ class ChargerLimits:
             align_tolerance_mm=_number(section, "align_tolerance_mm", minimum=0.0),
             coal_target_t=_number(section, "coal_target_t", minimum=0.1),
             feed_rate_t_per_min=_number(section, "feed_rate_t_per_min", minimum=0.1),
+            segment_count=_integer(section, "segment_count", minimum=1),
+            segment_deviation_t=_number(section, "segment_deviation_t", minimum=0.0),
+            scale_drift_tolerance_t=_number(section, "scale_drift_tolerance_t", minimum=0.001),
+            scale_max_rereads=_integer(section, "scale_max_rereads", minimum=0),
         )
         if limits.align_tolerance_mm <= 0.0:
             raise ConfigError("煤斗对齐公差必须为正", component="config")
         return limits
+
+
+@dataclass(frozen=True)
+class CoalGrade:
+    """煤种的段偏差策略。
+
+    ``stop_report``       段偏差越限即停止后续给煤并把这一炉报出来；
+    ``correct_continue``  段偏差越限按**真实称重差值**修正后续段目标后继续。
+    """
+
+    code: str
+    description: str
+    policy: str
+    segment_deviation_t: float
+
+    POLICIES = ("stop_report", "correct_continue")
+
+    @classmethod
+    def from_mapping(cls, section: Mapping[str, Any]) -> "CoalGrade":
+        code = section.get("code")
+        description = section.get("description", "")
+        policy = section.get("policy")
+        if not isinstance(code, str) or not code:
+            raise ConfigError("煤种 code 必须是非空字符串", component="config")
+        if not isinstance(description, str):
+            raise ConfigError("煤种 description 必须是字符串", component="config")
+        if policy not in cls.POLICIES:
+            raise ConfigError(f"煤种 {code} 的策略必须是 {cls.POLICIES} 之一", component="config")
+        deviation = _number(section, "segment_deviation_t", minimum=0.0)
+        return cls(code=code, description=description, policy=str(policy), segment_deviation_t=deviation)
+
+    def as_dict(self) -> dict:
+        return {
+            "code": self.code,
+            "description": self.description,
+            "policy": self.policy,
+            "segment_deviation_t": self.segment_deviation_t,
+        }
+
+
+@dataclass(frozen=True)
+class CoalGradeCatalog:
+    """煤种表：按 code 取策略，首个煤种为默认煤种。"""
+
+    grades: tuple[CoalGrade, ...]
+
+    @classmethod
+    def from_mapping(cls, raw: Any) -> "CoalGradeCatalog":
+        if not isinstance(raw, list) or not raw:
+            raise ConfigError("coal_grades 必须是非空列表", component="config")
+        grades = tuple(CoalGrade.from_mapping(item) for item in raw)
+        codes = [grade.code for grade in grades]
+        if len(set(codes)) != len(codes):
+            raise ConfigError("煤种 code 不得重复", component="config")
+        return cls(grades=grades)
+
+    def default_code(self) -> str:
+        return self.grades[0].code
+
+    def get(self, code: str) -> CoalGrade:
+        for grade in self.grades:
+            if grade.code == code:
+                return grade
+        raise ConfigError(f"未知煤种 {code!r}", component="config")
+
+    def as_list(self) -> list[dict]:
+        return [grade.as_dict() for grade in self.grades]
 
 
 @dataclass(frozen=True)
@@ -221,6 +307,7 @@ class PlatformConfig:
     pusher: PusherLimits
     guide: GuideLimits
     charger: ChargerLimits
+    coal_grades: CoalGradeCatalog
     quench: QuenchLimits
     collector: CollectorLimits
     door: DoorLimits
@@ -244,6 +331,7 @@ class PlatformConfig:
             pusher=PusherLimits.from_mapping(_section(limits, "pusher")),
             guide=GuideLimits.from_mapping(_section(limits, "guide")),
             charger=ChargerLimits.from_mapping(_section(limits, "charger")),
+            coal_grades=CoalGradeCatalog.from_mapping(mapping.get("coal_grades")),
             quench=QuenchLimits.from_mapping(_section(limits, "quench")),
             collector=CollectorLimits.from_mapping(_section(limits, "collector")),
             door=DoorLimits.from_mapping(_section(limits, "door")),
@@ -272,7 +360,18 @@ def default_config() -> PlatformConfig:
         storage_root="var/state",
         pusher=PusherLimits(3200.0, 25.0, 3350.0, 12.0, 38.0, 24.0),
         guide=GuideLimits(15.0, 120.0, 20.0),
-        charger=ChargerLimits(20.0, 28.0, 4.0),
+        charger=ChargerLimits(20.0, 28.0, 4.0, 4, 0.35, 0.2, 2),
+        coal_grades=CoalGradeCatalog(
+            (
+                CoalGrade("standard", "标准配合煤，越限即停料报炉", "stop_report", 0.35),
+                CoalGrade(
+                    "blend_b",
+                    "易塌孔配煤，允许按真实称重差值修正后续段",
+                    "correct_continue",
+                    0.5,
+                ),
+            )
+        ),
         quench=QuenchLimits(42.0, 1.6, 90.0, 320.0),
         collector=CollectorLimits(90.0, 18.0, 6.0),
         door=DoorLimits(60.0, 45.0),
@@ -286,6 +385,7 @@ def config_to_mapping(cfg: PlatformConfig) -> dict:
 
     return {
         "platform": {"name": cfg.name, "storage_root": cfg.storage_root},
+        "coal_grades": cfg.coal_grades.as_list(),
         "limits": {
             "pusher": {
                 "stroke_baseline_mm": cfg.pusher.stroke_baseline_mm,
@@ -304,6 +404,10 @@ def config_to_mapping(cfg: PlatformConfig) -> dict:
                 "align_tolerance_mm": cfg.charger.align_tolerance_mm,
                 "coal_target_t": cfg.charger.coal_target_t,
                 "feed_rate_t_per_min": cfg.charger.feed_rate_t_per_min,
+                "segment_count": cfg.charger.segment_count,
+                "segment_deviation_t": cfg.charger.segment_deviation_t,
+                "scale_drift_tolerance_t": cfg.charger.scale_drift_tolerance_t,
+                "scale_max_rereads": cfg.charger.scale_max_rereads,
             },
             "quench": {
                 "travel_distance_m": cfg.quench.travel_distance_m,

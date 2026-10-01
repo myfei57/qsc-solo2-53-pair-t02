@@ -16,6 +16,8 @@ class ChargerSnapshot:
     coal_load_t: float
     fed_t: float
     feeding: bool
+    delivered_t: float = 0.0
+    delivery_ratio: float = 1.0
 
     def as_dict(self) -> dict:
         return {
@@ -25,5 +27,7 @@ class ChargerSnapshot:
             "aligned": self.aligned,
             "coal_load_t": round(self.coal_load_t, 3),
             "fed_t": round(self.fed_t, 3),
+            "delivered_t": round(self.delivered_t, 3),
+            "delivery_ratio": round(self.delivery_ratio, 4),
             "feeding": self.feeding,
         }

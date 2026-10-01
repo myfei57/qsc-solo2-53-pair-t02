@@ -46,6 +46,8 @@ class Api:
         add("GET", "/api/timeline", self._timeline)
         add("GET", "/api/journal", self._journal)
         add("GET", "/api/readiness", self._readiness)
+        add("GET", "/api/charge-books", self._charge_books)
+        add("GET", "/api/charge-book/{op_id}", self._charge_book)
         add("POST", "/api/step", self._step)
         add("POST", "/api/charge", self._charge)
         add("POST", "/api/push", self._push)
@@ -54,6 +56,8 @@ class Api:
         add("POST", "/api/clean", self._clean)
         add("POST", "/api/calibrate", self._calibrate)
         add("POST", "/api/disturb", self._disturb)
+        add("POST", "/api/scale-drift", self._scale_drift)
+        add("POST", "/api/scale-link", self._scale_link)
         add("POST", "/api/concurrency", self._concurrency)
         add("POST", "/api/reset", lambda params, body: {"removed": self._platform.reset_state()})
 
@@ -142,12 +146,35 @@ class Api:
         return self._platform.cycle(dt=_as_float(body, "dt", 1.0))
 
     def _charge(self, params: dict, body: dict) -> dict:
+        grade = body.get("coal_grade")
+        ratio = body.get("delivery_ratio")
+        segment_ratios = body.get("segment_ratios")
+        if segment_ratios is not None:
+            if not isinstance(segment_ratios, list) or not all(
+                isinstance(item, (int, float)) and not isinstance(item, bool) for item in segment_ratios
+            ):
+                raise CokeError("参数 segment_ratios 必须是数值列表", component="console")
         return self._platform.charge(
             oven=str(body.get("oven", "oven01")),
             hopper_target_mm=_as_float(body, "hopper_target_mm", 0.0),
             hopper_measured_mm=_as_float(body, "hopper_measured_mm", 0.0),
             dt=_as_float(body, "dt", 1.0),
+            coal_grade=None if grade is None else str(grade),
+            delivery_ratio=None if ratio is None else float(ratio),
+            segment_ratios=None if segment_ratios is None else [float(item) for item in segment_ratios],
         )
+
+    def _charge_books(self, params: dict, body: dict) -> dict:
+        return {"books": self._platform.charge_books()}
+
+    def _charge_book(self, params: dict, body: dict) -> dict:
+        return self._platform.charge_book(str(params["op_id"]))
+
+    def _scale_drift(self, params: dict, body: dict) -> dict:
+        return self._platform.disturb_scale_drift(_as_float(body, "offset_t", 0.0))
+
+    def _scale_link(self, params: dict, body: dict) -> dict:
+        return self._platform.disturb_scale_link(int(body.get("count", 1)))
 
     def _push(self, params: dict, body: dict) -> dict:
         return self._platform.push(

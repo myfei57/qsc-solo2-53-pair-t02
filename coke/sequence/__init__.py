@@ -8,10 +8,17 @@
 
 from __future__ import annotations
 
-from .charging import charge_oven
+from .charging import charge_oven, charge_oven_segmented
 from .cleaning import clean_door
 from .pushing import push_oven
 from .quenching import quench_oven
 from .reversal import reverse_heating
 
-__all__ = ["charge_oven", "push_oven", "quench_oven", "reverse_heating", "clean_door"]
+__all__ = [
+    "charge_oven",
+    "charge_oven_segmented",
+    "push_oven",
+    "quench_oven",
+    "reverse_heating",
+    "clean_door",
+]
