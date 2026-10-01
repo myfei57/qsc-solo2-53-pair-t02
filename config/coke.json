@@ -20,7 +20,22 @@
     "charger": {
       "align_tolerance_mm": 20.0,
       "coal_target_t": 28.0,
-      "feed_rate_t_per_min": 4.0
+      "feed_rate_t_per_min": 4.0,
+      "segment_count": 4,
+      "coal_grades": {
+        "default": {
+          "deviation_policy": "correct_continue",
+          "segment_tolerance_t": 0.15,
+          "segment_tolerance_ratio": 0.02,
+          "trim_budget_t": 0.5
+        },
+        "level_strict": {
+          "deviation_policy": "stop_report",
+          "segment_tolerance_t": 0.12,
+          "segment_tolerance_ratio": 0.015,
+          "trim_budget_t": 0.0
+        }
+      }
     },
     "quench": {
       "travel_distance_m": 42.0,

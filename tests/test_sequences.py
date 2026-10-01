@@ -15,33 +15,49 @@ from coke.pusher.machine import PusherMachine
 from coke.pusher.stroke import StrokeBaseline
 from coke.quench.machine import QuenchCar
 from coke.sequence import charge_oven, push_oven, quench_oven
+from coke.weigher.weigher import OnlineWeigher
+
+
+def _charge_rig():
+    config = default_config()
+    return (
+        config,
+        ChargingCar(config.charger),
+        CollectorMain(config.collector),
+        BridgeFlap(FlapLatch()),
+        OnlineWeigher(),
+    )
 
 
 def test_charge_requires_hopper_alignment():
-    config = default_config()
-    charger = ChargingCar(config.charger)
-    collector = CollectorMain(config.collector)
-    flap = BridgeFlap(FlapLatch())
-    report = charge_oven(charger, collector, flap, "oven01", 0.0, 60.0)
+    config, charger, collector, flap, weigher = _charge_rig()
+    grade = config.charger.grade("default")
+    report = charge_oven(
+        charger, collector, flap, weigher, grade, "oven01", 0.0, 60.0
+    )
     assert report["ok"] is False
     assert "hopper_not_aligned" in report["violations"]
     assert [step["action"] for step in report["steps"]] == ["align_hopper"]
 
 
 def test_charge_pressure_precedes_flap_and_feed():
-    config = default_config()
-    charger = ChargingCar(config.charger)
-    collector = CollectorMain(config.collector)
-    flap = BridgeFlap(FlapLatch())
-    report = charge_oven(charger, collector, flap, "oven01", 0.0, 0.0)
+    config, charger, collector, flap, weigher = _charge_rig()
+    grade = config.charger.grade("default")
+    report = charge_oven(
+        charger, collector, flap, weigher, grade, "oven01", 0.0, 0.0
+    )
     assert report["ok"] is True
     order = [step["action"] for step in report["steps"]]
     assert order.index("align_hopper") < order.index("regulate_pressure")
     assert order.index("regulate_pressure") < order.index("open_flap")
-    assert order.index("open_flap") < order.index("feed")
+    assert order.index("open_flap") < order.index("feed_segment")
     assert charger.feed_complete()
     assert flap.latch.is_engaged()
     assert flap.latch.cycles() == 1
+    # 逐段判定口径定死：段数等于配置，整炉称重累计等于目标。
+    assert report["deviation_basis"] == "per_segment"
+    assert len(report["ledger"]["segments"]) == config.charger.segment_count
+    assert report["weighed_t"] == config.charger.coal_target_t
 
 
 def test_flap_rejects_double_open_until_reset():

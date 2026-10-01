@@ -13,9 +13,10 @@ import threading
 
 from .audit.log import AuditLog
 from .audit.record import AuditRecord
+from .charger.ledger import ChargeLedger, reconcile_charge
 from .charger.machine import ChargingCar
 from .clock import Clock, SystemClock
-from .config import PlatformConfig, default_config
+from .config import DEFAULT_GRADE, PlatformConfig, default_config
 from .door.latch import DoorLatch
 from .door.machine import DoorCleaner
 from .dust.damper import DustDamper
@@ -43,6 +44,7 @@ from .sequence import charge_oven, clean_door, push_oven, quench_oven, reverse_h
 from .store.journal import JsonlJournal
 from .store.jsonfile import JsonStore
 from .telemetry import TrendBuffer
+from .weigher.weigher import OnlineWeigher
 
 DEFAULT_UNIT = "battery1"
 DEFAULT_OVEN = "oven01"
@@ -81,6 +83,9 @@ class Platform:
         )
         self.guide = GuideCar(self.config.guide)
         self.charger = ChargingCar(self.config.charger)
+        self.weigher = OnlineWeigher()
+        self._charge_ledgers: dict[str, dict] = {}
+        self._flagged_ovens: set[str] = set()
         self.quench_car = QuenchCar(self.config.quench)
         self.collector = CollectorMain(self.config.collector)
         self.flap = BridgeFlap(FlapLatch())
@@ -105,6 +110,7 @@ class Platform:
             ("battery", "pusher", "pusher-machine"),
             ("battery", "guide", "guide-car"),
             ("battery", "charger", "charging-car"),
+            ("battery", "weigher", "online-weigher"),
             ("battery", "quench", "quench-car"),
             ("battery", "collector", "collector-main"),
             ("battery", "bridge_flap", "bridge-flap"),
@@ -148,7 +154,7 @@ class Platform:
                 key: value
                 for key, value in step.get("detail", {}).items()
                 if not isinstance(value, (dict, list))
-                and key not in ("oven", "op_id", "severity", "message")
+                and key not in ("oven", "op_id", "message")
             }
             self.bus.publish(
                 Event.of(
@@ -157,7 +163,7 @@ class Platform:
                     step["action"],
                     oven=oven,
                     op_id=op_id,
-                    severity="notice",
+                    severity=step.get("severity", "notice"),
                     **detail,
                 )
             )
@@ -217,20 +223,156 @@ class Platform:
         oven: str = DEFAULT_OVEN,
         hopper_target_mm: float = 0.0,
         hopper_measured_mm: float = 0.0,
+        coal_grade: str | None = None,
+        segment_variance_t: list[float] | None = None,
+        drift_at_segment: int | None = None,
         dt: float = 1.0,
     ) -> dict:
-        """装煤编排：煤斗对位 → 调压 → 开翻板 → 给煤。"""
+        """装煤编排：煤斗对位 → 调压 → 开翻板 → 分段称重给煤。
+
+        偏差按**逐段**判定，处置策略按煤种取（停下报炉 / 称重差值修正后续
+        给）。称重漂移属于部分失败，任何煤种都停炉报出、不许估数补足。
+        """
 
         with self._lock:
             op_id = self.ids.next()
+            grade = self.config.charger.grade(coal_grade)
             report = charge_oven(
-                self.charger, self.collector, self.flap, oven, hopper_target_mm, hopper_measured_mm, dt
+                self.charger,
+                self.collector,
+                self.flap,
+                self.weigher,
+                grade,
+                oven,
+                hopper_target_mm,
+                hopper_measured_mm,
+                segment_variance_t=segment_variance_t,
+                drift_at_segment=drift_at_segment,
+                dt=dt,
             )
             summary = self._record_operation(op_id, "charge", report)
             summary["op_id"] = op_id
+
+            # 落审计后做完整三方核对：分段累计账 / 称重回读 / 审计流水。
+            weigh_events = [
+                event.as_dict()["payload"]
+                for event in self.bus.history("charger")
+                if event.action == "feed_segment"
+                and event.payload.get("op_id") == op_id
+            ]
+            audit_records = [
+                entry
+                for entry in self.audit.entries(limit=512)
+                if entry["action"] == "feed_segment" and entry["payload"].get("op_id") == op_id
+            ]
+            audit_events = [entry["payload"] for entry in reversed(audit_records)]
+            ledger = self._ledger_from_report(report)
+            reconcile = reconcile_charge(ledger, weigh_events, audit_events)
+            if report.get("stopped"):
+                self._flagged_ovens.add(oven)
+            if not reconcile["consistent"]:
+                self._flagged_ovens.add(oven)
+                self.bus.publish(
+                    Event.of(
+                        "audit",
+                        "audit",
+                        "charge_reconcile_mismatch",
+                        oven=oven,
+                        op_id=op_id,
+                        severity="alarm",
+                        message=f"{oven} 装煤三方核对不一致",
+                    )
+                )
+            self._charge_ledgers[op_id] = {
+                "ledger": report.get("ledger"),
+                "reconcile": reconcile,
+                "oven": oven,
+                "ok": bool(report.get("ok")),
+            }
+            report["reconcile"] = reconcile
             self._operations += 1
             self._persist()
             return {**report, **summary}
+
+    @staticmethod
+    def _ledger_from_report(report: dict) -> ChargeLedger:
+        """从编排报告重建 :class:`ChargeLedger`，供三方核对使用。"""
+
+        from .charger.ledger import (
+            SEGMENT_CORRECTED,
+            SEGMENT_OK,
+            SEGMENT_OVERFED,
+            SEGMENT_STOPPED,
+            SEGMENT_WEIGH_FAILED,
+            SegmentRecord,
+        )
+
+        data = report["ledger"]
+        records = [
+            SegmentRecord(
+                index=item["index"],
+                target_t=item["target_t"],
+                tolerance_t=item["tolerance_t"],
+                delivered_t=item["delivered_t"],
+                weigh_before_t=item["weigh_before_t"],
+                weigh_after_t=item["weigh_after_t"],
+                weighed_delta_t=item["weighed_delta_t"],
+                deviation_t=item["deviation_t"],
+                within_tolerance=item["within_tolerance"],
+                result=item["result"],
+                policy=item["policy"],
+                trim_t=item["trim_t"],
+                weigh_valid=item["weigh_valid"],
+            )
+            for item in data["segments"]
+        ]
+        ledger = ChargeLedger(data["oven"], data["grade"], list(data["targets_t"]), records)
+        return ledger
+
+    def charge_ledger(self, op_id: str) -> dict:
+        """读一炉的分段累计账与三方核对结果，供控制台展示。"""
+
+        try:
+            return self._charge_ledgers[op_id]
+        except KeyError:
+            from .errors import InterlockError
+
+            raise InterlockError(f"未找到装煤作业: {op_id}", component="charger") from None
+
+    def flagged_ovens(self) -> list[str]:
+        """报出炉清单：段偏差停下、称重部分失败或三方核对不一致的炉。"""
+
+        return sorted(self._flagged_ovens)
+
+    def disturb_weigher(self, fault: bool = False) -> dict:
+        """注入在线称重异常（漂移为部分失败，fault=True 为完全失效）。"""
+
+        state = self.weigher.disturb(fault=fault)
+        self.bus.publish(
+            Event.of(
+                "weigher",
+                "weigher",
+                "weigh_drift" if not fault else "weigh_fault",
+                severity="alarm",
+                state=state,
+            )
+        )
+        return self.weigher.snapshot()
+
+    def recover_weigher(self) -> dict:
+        """排障后恢复在线称重，恢复后以最后有效累计为基线继续。"""
+
+        reading = self.weigher.recover()
+        self.bus.publish(
+            Event.of(
+                "weigher",
+                "weigher",
+                "weigh_recovered",
+                severity="notice",
+                cumulative_t=reading.cumulative_t or 0.0,
+            )
+        )
+        return self.weigher.snapshot()
 
     def push(
         self,
@@ -470,6 +612,9 @@ class Platform:
             },
             "guide": self.guide.snapshot().as_dict(),
             "charger": self.charger.snapshot().as_dict(),
+            "weigher": self.weigher.snapshot(),
+            "flagged_ovens": self.flagged_ovens(),
+            "charge_ledgers": len(self._charge_ledgers),
             "quench": self.quench_car.snapshot().as_dict(),
             "gas": {
                 "pressure_pa": round(self.collector.pressure_pa, 2),

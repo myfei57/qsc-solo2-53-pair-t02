@@ -87,23 +87,125 @@ class GuideLimits:
 
 
 @dataclass(frozen=True)
+class CoalGradeSettings:
+    """单一煤种的装煤核对策略。
+
+    ``deviation_policy`` 按煤种定死段偏差超限后的处置：``stop_report``
+    先停后续给煤并把这一炉报出来；``correct_continue`` 用在线称重差值做
+    一次修正给煤后继续。任何煤种在称重漂移（部分失败）时都不许按估数补足，
+    策略字段管不到这一条。
+    """
+
+    name: str
+    deviation_policy: str
+    segment_tolerance_t: float
+    segment_tolerance_ratio: float
+    trim_budget_t: float
+
+    @classmethod
+    def from_mapping(cls, name: str, section: Mapping[str, Any]) -> "CoalGradeSettings":
+        policy = section.get("deviation_policy", _MISSING)
+        if policy is _MISSING:
+            raise ConfigError(f"煤种 {name!r} 缺少字段 deviation_policy", component="config")
+        if policy not in DEVIATION_POLICIES:
+            raise ConfigError(
+                f"煤种 {name!r} 的 deviation_policy 必须是 {DEVIATION_POLICIES} 之一",
+                component="config",
+            )
+        settings = cls(
+            name=name,
+            deviation_policy=str(policy),
+            segment_tolerance_t=_number(section, "segment_tolerance_t", minimum=0.0),
+            segment_tolerance_ratio=_number(section, "segment_tolerance_ratio", minimum=0.0),
+            trim_budget_t=_number(section, "trim_budget_t", minimum=0.0),
+        )
+        if settings.segment_tolerance_t <= 0.0 and settings.segment_tolerance_ratio <= 0.0:
+            raise ConfigError(
+                f"煤种 {name!r} 的段公差绝对量与比例不能同时为零", component="config"
+            )
+        if settings.deviation_policy == POLICY_CORRECT_CONTINUE and settings.trim_budget_t <= 0.0:
+            raise ConfigError(
+                f"煤种 {name!r} 采用修正续给策略时 trim_budget_t 必须为正",
+                component="config",
+            )
+        return settings
+
+    def tolerance_for(self, segment_target_t: float) -> float:
+        """段公差取绝对量与比例量的较大者，避免小目标段被比例量卡死。"""
+
+        return max(self.segment_tolerance_t, self.segment_tolerance_ratio * segment_target_t)
+
+    def as_mapping(self) -> dict:
+        return {
+            "deviation_policy": self.deviation_policy,
+            "segment_tolerance_t": self.segment_tolerance_t,
+            "segment_tolerance_ratio": self.segment_tolerance_ratio,
+            "trim_budget_t": self.trim_budget_t,
+        }
+
+
+POLICY_STOP_REPORT = "stop_report"
+POLICY_CORRECT_CONTINUE = "correct_continue"
+DEVIATION_POLICIES = (POLICY_STOP_REPORT, POLICY_CORRECT_CONTINUE)
+DEFAULT_GRADE = "default"
+
+
+@dataclass(frozen=True)
 class ChargerLimits:
-    """装煤车煤斗对齐与给煤约束。"""
+    """装煤车煤斗对齐、分段给煤与煤种策略约束。"""
 
     align_tolerance_mm: float
     coal_target_t: float
     feed_rate_t_per_min: float
+    segment_count: int
+    coal_grades: dict[str, CoalGradeSettings]
 
     @classmethod
     def from_mapping(cls, section: Mapping[str, Any]) -> "ChargerLimits":
-        limits = cls(
-            align_tolerance_mm=_number(section, "align_tolerance_mm", minimum=0.0),
+        align_tolerance_mm = _number(section, "align_tolerance_mm", minimum=0.0)
+        if align_tolerance_mm <= 0.0:
+            raise ConfigError("煤斗对齐公差必须为正", component="config")
+        segment_count = int(_number(section, "segment_count", minimum=1.0))
+        grades_section = section.get("coal_grades", _MISSING)
+        if grades_section is _MISSING:
+            raise ConfigError("配置缺少字段 coal_grades", component="config")
+        if not isinstance(grades_section, Mapping):
+            raise ConfigError("字段 coal_grades 必须是映射", component="config")
+        grades = {
+            str(name): CoalGradeSettings.from_mapping(str(name), grade)
+            for name, grade in grades_section.items()
+            if isinstance(grade, Mapping)
+        }
+        if len(grades) != len(grades_section):
+            raise ConfigError("煤种配置每一项都必须是映射", component="config")
+        if DEFAULT_GRADE not in grades:
+            raise ConfigError(f"coal_grades 必须包含兜底煤种 {DEFAULT_GRADE!r}", component="config")
+        return cls(
+            align_tolerance_mm=align_tolerance_mm,
             coal_target_t=_number(section, "coal_target_t", minimum=0.1),
             feed_rate_t_per_min=_number(section, "feed_rate_t_per_min", minimum=0.1),
+            segment_count=segment_count,
+            coal_grades=grades,
         )
-        if limits.align_tolerance_mm <= 0.0:
-            raise ConfigError("煤斗对齐公差必须为正", component="config")
-        return limits
+
+    def grade(self, name: str | None = None) -> CoalGradeSettings:
+        """按名取煤种策略；未登记的煤种在运行期按联锁拒绝处理。"""
+
+        from .errors import InterlockError
+
+        key = name or DEFAULT_GRADE
+        try:
+            return self.coal_grades[key]
+        except KeyError:
+            raise InterlockError(f"未登记的煤种: {key}", component="charger") from None
+
+    def segment_targets(self) -> list[float]:
+        """按炭化室容量等分整炉给煤量，余量并入末段，避免累计漂移。"""
+
+        base = round(self.coal_target_t / self.segment_count, 3)
+        targets = [base] * self.segment_count
+        targets[-1] = round(self.coal_target_t - base * (self.segment_count - 1), 3)
+        return targets
 
 
 @dataclass(frozen=True)
@@ -272,7 +374,20 @@ def default_config() -> PlatformConfig:
         storage_root="var/state",
         pusher=PusherLimits(3200.0, 25.0, 3350.0, 12.0, 38.0, 24.0),
         guide=GuideLimits(15.0, 120.0, 20.0),
-        charger=ChargerLimits(20.0, 28.0, 4.0),
+        charger=ChargerLimits(
+            20.0,
+            28.0,
+            4.0,
+            4,
+            {
+                DEFAULT_GRADE: CoalGradeSettings(
+                    DEFAULT_GRADE, POLICY_CORRECT_CONTINUE, 0.15, 0.02, 0.5
+                ),
+                "level_strict": CoalGradeSettings(
+                    "level_strict", POLICY_STOP_REPORT, 0.12, 0.015, 0.0
+                ),
+            },
+        ),
         quench=QuenchLimits(42.0, 1.6, 90.0, 320.0),
         collector=CollectorLimits(90.0, 18.0, 6.0),
         door=DoorLimits(60.0, 45.0),
@@ -304,6 +419,10 @@ def config_to_mapping(cfg: PlatformConfig) -> dict:
                 "align_tolerance_mm": cfg.charger.align_tolerance_mm,
                 "coal_target_t": cfg.charger.coal_target_t,
                 "feed_rate_t_per_min": cfg.charger.feed_rate_t_per_min,
+                "segment_count": cfg.charger.segment_count,
+                "coal_grades": {
+                    name: grade.as_mapping() for name, grade in cfg.charger.coal_grades.items()
+                },
             },
             "quench": {
                 "travel_distance_m": cfg.quench.travel_distance_m,

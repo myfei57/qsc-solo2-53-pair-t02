@@ -19,6 +19,7 @@ packages = [
     "coke.pusher",
     "coke.guide",
     "coke.charger",
+    "coke.weigher",
     "coke.quench",
     "coke.gas",
     "coke.door",

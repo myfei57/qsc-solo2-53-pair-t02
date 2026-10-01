@@ -46,8 +46,12 @@ class Api:
         add("GET", "/api/timeline", self._timeline)
         add("GET", "/api/journal", self._journal)
         add("GET", "/api/readiness", self._readiness)
+        add("GET", "/api/charge-ledger/{op_id}", self._charge_ledger)
+        add("GET", "/api/flagged-ovens", lambda params, body: {"ovens": self._platform.flagged_ovens()})
         add("POST", "/api/step", self._step)
         add("POST", "/api/charge", self._charge)
+        add("POST", "/api/weigher/drift", self._weigher_drift)
+        add("POST", "/api/weigher/recover", lambda params, body: self._platform.recover_weigher())
         add("POST", "/api/push", self._push)
         add("POST", "/api/quench", self._quench)
         add("POST", "/api/reverse", self._reverse)
@@ -142,12 +146,25 @@ class Api:
         return self._platform.cycle(dt=_as_float(body, "dt", 1.0))
 
     def _charge(self, params: dict, body: dict) -> dict:
+        variance = body.get("segment_variance_t")
+        if variance is not None and not isinstance(variance, list):
+            raise CokeError("参数 segment_variance_t 必须是数组", component="console")
+        drift = body.get("drift_at_segment")
         return self._platform.charge(
             oven=str(body.get("oven", "oven01")),
             hopper_target_mm=_as_float(body, "hopper_target_mm", 0.0),
             hopper_measured_mm=_as_float(body, "hopper_measured_mm", 0.0),
+            coal_grade=(str(body["coal_grade"]) if body.get("coal_grade") is not None else None),
+            segment_variance_t=[float(value) for value in variance] if variance is not None else None,
+            drift_at_segment=int(drift) if drift is not None else None,
             dt=_as_float(body, "dt", 1.0),
         )
+
+    def _charge_ledger(self, params: dict, body: dict) -> dict:
+        return self._platform.charge_ledger(str(params["op_id"]))
+
+    def _weigher_drift(self, params: dict, body: dict) -> dict:
+        return self._platform.disturb_weigher(fault=bool(body.get("fault", False)))
 
     def _push(self, params: dict, body: dict) -> dict:
         return self._platform.push(
